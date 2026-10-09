@@ -796,53 +796,28 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
 
     // One client per worker slot, created here on the coordinator thread. Slot 0 doubles as the
     // coordinator's client for localization, which is safe because workers are joined between chunks.
-    const size_t client_count = std::min(concurrency, files.size());
-    auto clients = create_worker_clients(llm_factory, client_count);
+    auto clients = create_worker_clients(llm_factory, std::min(concurrency, files.size()));
 
     SessionHistoryMap session_history;
-    // One chunk per round of requests. Queue and progress lines then appear as requests start,
-    // rather than all at once for a larger batch.
-    const size_t chunk_size = concurrency;
     const int remote_requests_per_minute = is_local_llm ? 0 : resolve_remote_requests_per_minute();
     const RemoteThrottleCallback remote_throttle_callback =
         make_remote_throttle(remote_requests_per_minute, callbacks.progress, stop_flag);
 
     size_t completed_items = 0;
-    for (size_t chunk_begin = 0; chunk_begin < files.size() && !stop_flag.load(); chunk_begin += chunk_size) {
-        const size_t chunk_end = std::min(files.size(), chunk_begin + chunk_size);
+    // One chunk per round of requests. Queue and progress lines then appear as requests start,
+    // rather than all at once for a larger batch.
+    for (size_t chunk_begin = 0; chunk_begin < files.size() && !stop_flag.load(); chunk_begin += concurrency) {
+        const size_t chunk_end = std::min(files.size(), chunk_begin + concurrency);
 
         // Phase 1 (coordinator): prepare every entry in input order. Cache, credential and
         // throttle decisions happen here, exactly as in categorize_with_cache().
-        // Per-entry state for this chunk. Items that need no request carry their resolved category
-        // directly; the rest refer to a slot in `requests`.
-        std::vector<ConcurrentChunkItem> items;
-        items.reserve(chunk_end - chunk_begin);
-        std::vector<PreparedEntry> requests;
-        requests.reserve(chunk_end - chunk_begin);
-        for (size_t index = chunk_begin; index < chunk_end; ++index) {
-            if (stop_flag.load()) {
-                break;
-            }
-            const FileEntry& entry = files[index];
-            if (callbacks.queue) {
-                callbacks.queue(entry);
-            }
-            ConcurrentChunkItem item = prepare_chunk_item(entry,
-                                                          is_local_llm,
-                                                          callbacks,
-                                                          remote_throttle_callback,
-                                                          session_history);
-            if (item.needs_request) {
-                item.request_index = requests.size();
-                requests.push_back(item.prepared);
-            }
-            items.push_back(std::move(item));
-        }
+        ConcurrentChunk chunk = prepare_chunk(files, chunk_begin, chunk_end, is_local_llm, stop_flag,
+                                              callbacks, remote_throttle_callback, session_history);
 
         // Phase 2 (workers): only the HTTP round trip runs off-thread. Each worker uses its own client
         // and writes only its own outcome slot. No shared categorization state is read or written here.
         auto outcomes = BoundedWorkExecutor::run_batch(
-            requests,
+            chunk.requests,
             clients,
             stop_flag,
             [this, is_local_llm, &stop_flag](std::unique_ptr<ILLMClient>& client,
@@ -854,20 +829,23 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
         // Phase 3 (coordinator): commit in input order. All workers have been joined, so the
         // coordinator may use any client, and it alone touches the DB, learning store and history.
         ILLMClient& coordinator_llm = *clients.front();
-        for (auto& item : items) {
+        for (auto& item : chunk.items) {
             auto* outcome = item.request_index ? &outcomes[*item.request_index] : nullptr;
-            if (commit_chunk_item(item,
-                                  outcome,
-                                  coordinator_llm,
-                                  is_local_llm,
-                                  callbacks,
-                                  session_history,
+            if (commit_chunk_item(item, outcome, coordinator_llm, is_local_llm, callbacks, session_history,
                                   categorized)) {
                 ++completed_items;
             }
         }
     }
 
+    log_concurrent_run(completed_items, started_at, concurrency);
+    return categorized;
+}
+
+void CategorizationService::log_concurrent_run(size_t completed_items,
+                                               std::chrono::steady_clock::time_point started_at,
+                                               size_t concurrency) const
+{
     if (core_logger) {
         const double elapsed_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
@@ -876,7 +854,6 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
                           elapsed_seconds,
                           concurrency);
     }
-    return categorized;
 }
 
 std::vector<std::unique_ptr<ILLMClient>> CategorizationService::create_worker_clients(
@@ -893,6 +870,40 @@ std::vector<std::unique_ptr<ILLMClient>> CategorizationService::create_worker_cl
         clients.push_back(std::move(client));
     }
     return clients;
+}
+
+CategorizationService::ConcurrentChunk CategorizationService::prepare_chunk(
+    const std::vector<FileEntry>& files,
+    size_t chunk_begin,
+    size_t chunk_end,
+    bool is_local_llm,
+    std::atomic<bool>& stop_flag,
+    const EntryCallbacks& callbacks,
+    const RemoteThrottleCallback& remote_throttle_callback,
+    const SessionHistoryMap& session_history) const
+{
+    // Per-entry state for this chunk. Items that need no request carry their resolved category
+    // directly; the rest refer to a slot in `requests`.
+    ConcurrentChunk chunk;
+    chunk.items.reserve(chunk_end - chunk_begin);
+    chunk.requests.reserve(chunk_end - chunk_begin);
+    for (size_t index = chunk_begin; index < chunk_end; ++index) {
+        if (stop_flag.load()) {
+            break;
+        }
+        const FileEntry& entry = files[index];
+        if (callbacks.queue) {
+            callbacks.queue(entry);
+        }
+        ConcurrentChunkItem item = prepare_chunk_item(entry, is_local_llm, callbacks,
+                                                      remote_throttle_callback, session_history);
+        if (item.needs_request) {
+            item.request_index = chunk.requests.size();
+            chunk.requests.push_back(item.prepared);
+        }
+        chunk.items.push_back(std::move(item));
+    }
+    return chunk;
 }
 
 CategorizationService::ConcurrentChunkItem CategorizationService::prepare_chunk_item(
@@ -950,33 +961,7 @@ bool CategorizationService::commit_chunk_item(
             }
             return false;
         }
-        if (outcome->error) {
-            // Same semantics as the sequential path: a request failure is logged and aborts the run.
-            try {
-                std::rethrow_exception(outcome->error);
-            } catch (const std::exception& ex) {
-                report_llm_failure(callbacks.progress, entry.file_name, ex);
-                throw;
-            }
-        }
-        const LlmResponse& response = outcome->value.value();
-        for (const auto& note : response.notes) {
-            if (callbacks.progress) {
-                callbacks.progress(note);
-            }
-        }
-        if (response.cancelled) {
-            cancelled = true;
-        } else {
-            item.resolved = resolve_llm_category_response(coordinator_llm,
-                                                          entry.file_name,
-                                                          prepared.display_path,
-                                                          prepared.prompt_name,
-                                                          prepared.prompt_path_display,
-                                                          entry.type,
-                                                          callbacks.progress,
-                                                          response.raw);
-        }
+        cancelled = apply_request_outcome(item, *outcome, coordinator_llm, callbacks.progress);
     } else if (item.cache_hit) {
         const auto display_resolved = localize_resolved_category(coordinator_llm, item.resolved);
         emit_progress_message(callbacks.progress,
@@ -988,22 +973,68 @@ bool CategorizationService::commit_chunk_item(
     }
 
     if (!cancelled) {
-        if (auto categorized_entry = finish_entry(prepared,
-                                                  item.resolved,
-                                                  is_local_llm,
-                                                  callbacks.recategorization,
-                                                  session_history)) {
-            categorized.push_back(*categorized_entry);
-            if (callbacks.result) {
-                callbacks.result(*categorized_entry);
-            }
-        }
+        record_finished_entry(item, is_local_llm, callbacks, session_history, categorized);
     }
 
     if (callbacks.completion) {
         callbacks.completion(entry);
     }
     return true;
+}
+
+bool CategorizationService::apply_request_outcome(ConcurrentChunkItem& item,
+                                                  BoundedWorkExecutor::Outcome<LlmResponse>& outcome,
+                                                  ILLMClient& coordinator_llm,
+                                                  const ProgressCallback& progress) const
+{
+    const auto& prepared = item.prepared;
+    const FileEntry& entry = prepared.entry;
+    if (outcome.error) {
+        // Same semantics as the sequential path: a request failure is logged and aborts the run.
+        try {
+            std::rethrow_exception(outcome.error);
+        } catch (const std::exception& ex) {
+            report_llm_failure(progress, entry.file_name, ex);
+            throw;
+        }
+    }
+    const LlmResponse& response = outcome.value.value();
+    for (const auto& note : response.notes) {
+        if (progress) {
+            progress(note);
+        }
+    }
+    if (response.cancelled) {
+        return true;
+    }
+    item.resolved = resolve_llm_category_response(coordinator_llm,
+                                                  entry.file_name,
+                                                  prepared.display_path,
+                                                  prepared.prompt_name,
+                                                  prepared.prompt_path_display,
+                                                  entry.type,
+                                                  progress,
+                                                  response.raw);
+    return false;
+}
+
+void CategorizationService::record_finished_entry(const ConcurrentChunkItem& item,
+                                                  bool is_local_llm,
+                                                  const EntryCallbacks& callbacks,
+                                                  SessionHistoryMap& session_history,
+                                                  std::vector<CategorizedFile>& categorized) const
+{
+    const auto& prepared = item.prepared;
+    if (auto categorized_entry = finish_entry(prepared,
+                                              item.resolved,
+                                              is_local_llm,
+                                              callbacks.recategorization,
+                                              session_history)) {
+        categorized.push_back(*categorized_entry);
+        if (callbacks.result) {
+            callbacks.result(*categorized_entry);
+        }
+    }
 }
 
 CategorizationService::LlmResponse CategorizationService::execute_llm_request(
@@ -1616,6 +1647,57 @@ void CategorizationService::apply_whitelist_to_resolved(
     }
 }
 
+DatabaseManager::ResolvedCategory CategorizationService::resolve_llm_labels(
+    const std::string& display_name,
+    const std::string& prompt_name,
+    const std::string& prompt_path,
+    FileType file_type,
+    std::string category,
+    std::string subcategory) const
+{
+    const auto allowed_categories = settings.get_allowed_categories();
+    const auto allowed_subcategories = settings.get_allowed_subcategories();
+    const auto allowed_subcategories_by_category = settings.get_allowed_subcategories_by_category();
+    const auto effective_allowed_categories =
+        allowed_categories_for_whitelist(allowed_categories, allowed_subcategories_by_category);
+    std::tie(category, subcategory) = normalize_llm_labels(display_name,
+                                                           prompt_name,
+                                                           file_type,
+                                                           category,
+                                                           subcategory,
+                                                           effective_allowed_categories);
+    auto resolved = db_manager.resolve_category(category, subcategory);
+    apply_whitelist_to_resolved(resolved,
+                                effective_allowed_categories,
+                                allowed_subcategories,
+                                allowed_subcategories_by_category);
+    return prefer_learned_candidate_for_generic_result(resolved, prompt_name, prompt_path, file_type);
+}
+
+bool CategorizationService::report_invalid_labels(const DatabaseManager::ResolvedCategory& resolved,
+                                                  const std::string& display_name,
+                                                  const ProgressCallback& progress_callback) const
+{
+    const auto validation = CategorizationResponseParser::validate_labels(resolved.category,
+                                                                          resolved.subcategory);
+    if (validation.valid) {
+        return false;
+    }
+    if (progress_callback) {
+        progress_callback(fmt::format("[LLM-ERROR] {} (invalid category/subcategory: {})",
+                                      display_name,
+                                      validation.error));
+    }
+    if (core_logger) {
+        core_logger->warn("Invalid LLM output for '{}': {} (cat='{}', sub='{}')",
+                          display_name,
+                          validation.error,
+                          resolved.category,
+                          resolved.subcategory);
+    }
+    return true;
+}
+
 DatabaseManager::ResolvedCategory CategorizationService::resolve_llm_category_response(
     ILLMClient& llm,
     const std::string& display_name,
@@ -1631,38 +1713,9 @@ DatabaseManager::ResolvedCategory CategorizationService::resolve_llm_category_re
         auto [category, subcategory] =
             CategorizationResponseParser::split_category_subcategory(category_subcategory);
 
-        const auto allowed_categories = settings.get_allowed_categories();
-        const auto allowed_subcategories = settings.get_allowed_subcategories();
-        const auto allowed_subcategories_by_category = settings.get_allowed_subcategories_by_category();
-        const auto effective_allowed_categories =
-            allowed_categories_for_whitelist(allowed_categories, allowed_subcategories_by_category);
-        std::tie(category, subcategory) = normalize_llm_labels(display_name,
-                                                               prompt_name,
-                                                               file_type,
-                                                               category,
-                                                               subcategory,
-                                                               effective_allowed_categories);
-        auto resolved = db_manager.resolve_category(category, subcategory);
-        apply_whitelist_to_resolved(resolved,
-                                    effective_allowed_categories,
-                                    allowed_subcategories,
-                                    allowed_subcategories_by_category);
-        resolved = prefer_learned_candidate_for_generic_result(resolved, prompt_name, prompt_path, file_type);
-        const auto validation = CategorizationResponseParser::validate_labels(resolved.category,
-                                                                              resolved.subcategory);
-        if (!validation.valid) {
-            if (progress_callback) {
-                progress_callback(fmt::format("[LLM-ERROR] {} (invalid category/subcategory: {})",
-                                              display_name,
-                                              validation.error));
-            }
-            if (core_logger) {
-                core_logger->warn("Invalid LLM output for '{}': {} (cat='{}', sub='{}')",
-                                  display_name,
-                                  validation.error,
-                                  resolved.category,
-                                  resolved.subcategory);
-            }
+        auto resolved = resolve_llm_labels(display_name, prompt_name, prompt_path, file_type,
+                                           category, subcategory);
+        if (report_invalid_labels(resolved, display_name, progress_callback)) {
             return DatabaseManager::ResolvedCategory{-1, "", ""};
         }
         if (resolved.category.empty()) {
