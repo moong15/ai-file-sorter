@@ -355,6 +355,9 @@ std::string normalize_visual_model_id(const std::string& value)
     if (is_custom_visual_model_id(trimmed)) {
         return trimmed;
     }
+    if (is_api_visual_model_id(trimmed)) {
+        return trimmed;
+    }
     if (find_visual_model_descriptor(trimmed)) {
         return trimmed;
     }
@@ -647,6 +650,8 @@ void Settings::load_custom_api_settings()
         entry.base_url = config.getValue(section, "BaseUrl", "");
         entry.api_key = config.getValue(section, "ApiKey", "");
         entry.model = config.getValue(section, "Model", "");
+        // Missing key reads as "false", so endpoints saved before this field keep working.
+        entry.supports_vision = config.getValue(section, "SupportsVision", "false") == "true";
         entry.name = trim_copy(entry.name);
         entry.description = trim_copy(entry.description);
         entry.base_url = trim_copy(entry.base_url);
@@ -806,6 +811,7 @@ void Settings::save_custom_api_endpoints()
         config.setValue(section, "BaseUrl", entry.base_url);
         config.setValue(section, "ApiKey", entry.api_key);
         config.setValue(section, "Model", entry.model);
+        set_bool_setting(config, section, "SupportsVision", entry.supports_vision);
     }
     config.setValue(api_section, "CustomApiIds", join_list(ids));
 }

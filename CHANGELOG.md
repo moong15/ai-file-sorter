@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- Added an LLM concurrent requests setting (1, 2, 4, 6, or 8 parallel requests) that speeds up text categorization and document analysis with ChatGPT or a custom OpenAI-compatible API endpoint. Results are still committed in input order.
+- Added an LLM concurrent requests setting (1, 2, 4, 6, or 8 parallel requests) that speeds up text categorization and document analysis with ChatGPT or a custom OpenAI-compatible API endpoint, and image analysis with an OpenAI-compatible visual API endpoint. Results are still committed in input order.
+- Added support for OpenAI-compatible API endpoints as image analysis backends: custom endpoints can be marked as vision-capable and appear as `API: <name>` in the visual model selector, so image analysis no longer needs local GGUF or mmproj files for them.
 
 ## [1.9.2] - 2026-08-14
 
