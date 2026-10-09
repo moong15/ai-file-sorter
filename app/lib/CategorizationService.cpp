@@ -442,6 +442,26 @@ std::pair<std::string, std::string> normalize_artifact_category_labels(
     return {normalized->category, normalized->subcategory};
 }
 
+// Logs a normalizer's label change for one file kind; silent when the labels are unchanged.
+void log_label_change(const std::shared_ptr<spdlog::logger>& logger,
+                      const char* kind,
+                      const std::string& display_name,
+                      const std::pair<std::string, std::string>& before,
+                      const std::string& category,
+                      const std::string& subcategory)
+{
+    if (!logger || (category == before.first && subcategory == before.second)) {
+        return;
+    }
+    logger->info("Normalized {} category for '{}' from '{}'/'{}' to '{}'/'{}'",
+                 kind,
+                 display_name,
+                 before.first,
+                 before.second,
+                 category,
+                 subcategory);
+}
+
 // Returns the first allowed entry or an empty string when the list is empty.
 std::string first_allowed_or_blank(const std::vector<std::string>& allowed) {
     return allowed.empty() ? std::string() : allowed.front();
@@ -659,18 +679,19 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries(
     // Concurrency only applies to OpenAI-compatible remote backends; see Settings::effective_llm_concurrency().
     const size_t concurrency = is_local_llm ? 1 : settings.effective_llm_concurrency();
     if (concurrency > 1) {
+        const EntryCallbacks callbacks{progress_callback,
+                                       queue_callback,
+                                       completion_callback,
+                                       recategorization_callback,
+                                       prompt_override,
+                                       suggested_name_provider,
+                                       result_callback};
         return categorize_entries_concurrent(files,
                                              is_local_llm,
                                              concurrency,
                                              stop_flag,
-                                             progress_callback,
-                                             queue_callback,
-                                             completion_callback,
-                                             recategorization_callback,
                                              llm_factory,
-                                             prompt_override,
-                                             suggested_name_provider,
-                                             result_callback);
+                                             callbacks);
     }
 
     auto llm = llm_factory ? llm_factory() : nullptr;
@@ -766,16 +787,9 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
     bool is_local_llm,
     size_t concurrency,
     std::atomic<bool>& stop_flag,
-    const ProgressCallback& progress_callback,
-    const QueueCallback& queue_callback,
-    const CompletionCallback& completion_callback,
-    const RecategorizationCallback& recategorization_callback,
     const std::function<std::unique_ptr<ILLMClient>()>& llm_factory,
-    const PromptOverrideProvider& prompt_override,
-    const SuggestedNameProvider& suggested_name_provider,
-    const ResultCallback& result_callback) const
+    const EntryCallbacks& callbacks) const
 {
-
     const auto started_at = std::chrono::steady_clock::now();
     std::vector<CategorizedFile> categorized;
     categorized.reserve(files.size());
@@ -783,15 +797,7 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
     // One client per worker slot, created here on the coordinator thread. Slot 0 doubles as the
     // coordinator's client for localization, which is safe because workers are joined between chunks.
     const size_t client_count = std::min(concurrency, files.size());
-    std::vector<std::unique_ptr<ILLMClient>> clients;
-    clients.reserve(client_count);
-    for (size_t i = 0; i < client_count; ++i) {
-        auto client = llm_factory ? llm_factory() : nullptr;
-        if (!client) {
-            throw std::runtime_error("Failed to create LLM client.");
-        }
-        clients.push_back(std::move(client));
-    }
+    auto clients = create_worker_clients(llm_factory, client_count);
 
     SessionHistoryMap session_history;
     // One chunk per round of requests. Queue and progress lines then appear as requests start,
@@ -799,16 +805,7 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
     const size_t chunk_size = concurrency;
     const int remote_requests_per_minute = is_local_llm ? 0 : resolve_remote_requests_per_minute();
     const RemoteThrottleCallback remote_throttle_callback =
-        make_remote_throttle(remote_requests_per_minute, progress_callback, stop_flag);
-
-    // Per-entry state for one chunk. Items that need no request carry their resolved category
-    // directly; the rest refer to a slot in `requests`.
-    struct ChunkItem {
-        PreparedEntry prepared;
-        DatabaseManager::ResolvedCategory resolved;
-        bool cache_hit{false};
-        std::optional<size_t> request_index;
-    };
+        make_remote_throttle(remote_requests_per_minute, callbacks.progress, stop_flag);
 
     size_t completed_items = 0;
     for (size_t chunk_begin = 0; chunk_begin < files.size() && !stop_flag.load(); chunk_begin += chunk_size) {
@@ -816,7 +813,9 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
 
         // Phase 1 (coordinator): prepare every entry in input order. Cache, credential and
         // throttle decisions happen here, exactly as in categorize_with_cache().
-        std::vector<ChunkItem> items;
+        // Per-entry state for this chunk. Items that need no request carry their resolved category
+        // directly; the rest refer to a slot in `requests`.
+        std::vector<ConcurrentChunkItem> items;
         items.reserve(chunk_end - chunk_begin);
         std::vector<PreparedEntry> requests;
         requests.reserve(chunk_end - chunk_begin);
@@ -825,32 +824,17 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
                 break;
             }
             const FileEntry& entry = files[index];
-            if (queue_callback) {
-                queue_callback(entry);
+            if (callbacks.queue) {
+                callbacks.queue(entry);
             }
-            const std::string suggested_name = suggested_name_provider
-                ? suggested_name_provider(entry)
-                : std::string();
-            const auto override_value = prompt_override ? prompt_override(entry) : std::nullopt;
-
-            ChunkItem item;
-            item.prepared = prepare_entry(entry, override_value, suggested_name, session_history);
-            const auto& prepared = item.prepared;
-            if (auto cached = try_cached_categorization(entry.file_name,
-                                                        prepared.display_path,
-                                                        prepared.prompt_path_display,
-                                                        prepared.dir_path,
-                                                        entry.type,
-                                                        progress_callback)) {
-                item.resolved = *cached;
-                item.cache_hit = true;
-            } else if (!is_local_llm && !ensure_remote_credentials_for_request(entry.file_name, progress_callback)) {
-                item.resolved = DatabaseManager::ResolvedCategory{-1, "", ""};
-            } else if (!is_local_llm && remote_throttle_callback && !remote_throttle_callback(entry.file_name)) {
-                item.resolved = DatabaseManager::ResolvedCategory{-1, "", ""};
-            } else {
+            ConcurrentChunkItem item = prepare_chunk_item(entry,
+                                                          is_local_llm,
+                                                          callbacks,
+                                                          remote_throttle_callback,
+                                                          session_history);
+            if (item.needs_request) {
                 item.request_index = requests.size();
-                requests.push_back(prepared);
+                requests.push_back(item.prepared);
             }
             items.push_back(std::move(item));
         }
@@ -871,73 +855,15 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
         // coordinator may use any client, and it alone touches the DB, learning store and history.
         ILLMClient& coordinator_llm = *clients.front();
         for (auto& item : items) {
-            const auto& prepared = item.prepared;
-            const FileEntry& entry = prepared.entry;
-            bool cancelled = false;
-
-            if (item.request_index) {
-                auto& outcome = outcomes[*item.request_index];
-                if (!outcome.attempted()) {
-                    // Stop was requested before this request began: no effects and no result, but the
-                    // queued item still gets its completion so the GUI row does not stay "in progress".
-                    if (completion_callback) {
-                        completion_callback(entry);
-                    }
-                    continue;
-                }
-                if (outcome.error) {
-                    // Same semantics as the sequential path: a request failure is logged and aborts the run.
-                    try {
-                        std::rethrow_exception(outcome.error);
-                    } catch (const std::exception& ex) {
-                        report_llm_failure(progress_callback, entry.file_name, ex);
-                        throw;
-                    }
-                }
-                const LlmResponse& response = outcome.value.value();
-                for (const auto& note : response.notes) {
-                    if (progress_callback) {
-                        progress_callback(note);
-                    }
-                }
-                if (response.cancelled) {
-                    cancelled = true;
-                } else {
-                    item.resolved = resolve_llm_category_response(coordinator_llm,
-                                                                  entry.file_name,
-                                                                  prepared.display_path,
-                                                                  prepared.prompt_name,
-                                                                  prepared.prompt_path_display,
-                                                                  entry.type,
-                                                                  progress_callback,
-                                                                  response.raw);
-                }
-            } else if (item.cache_hit) {
-                const auto display_resolved = localize_resolved_category(coordinator_llm, item.resolved);
-                emit_progress_message(progress_callback,
-                                      "CACHE",
-                                      entry.file_name,
-                                      display_resolved,
-                                      prepared.display_path,
-                                      prepared.prompt_path_display);
-            }
-
-            if (!cancelled) {
-                if (auto categorized_entry = finish_entry(prepared,
-                                                          item.resolved,
-                                                          is_local_llm,
-                                                          recategorization_callback,
-                                                          session_history)) {
-                    categorized.push_back(*categorized_entry);
-                    if (result_callback) {
-                        result_callback(*categorized_entry);
-                    }
-                }
-            }
-
-            ++completed_items;
-            if (completion_callback) {
-                completion_callback(entry);
+            auto* outcome = item.request_index ? &outcomes[*item.request_index] : nullptr;
+            if (commit_chunk_item(item,
+                                  outcome,
+                                  coordinator_llm,
+                                  is_local_llm,
+                                  callbacks,
+                                  session_history,
+                                  categorized)) {
+                ++completed_items;
             }
         }
     }
@@ -951,6 +877,133 @@ std::vector<CategorizedFile> CategorizationService::categorize_entries_concurren
                           concurrency);
     }
     return categorized;
+}
+
+std::vector<std::unique_ptr<ILLMClient>> CategorizationService::create_worker_clients(
+    const std::function<std::unique_ptr<ILLMClient>()>& llm_factory,
+    size_t count) const
+{
+    std::vector<std::unique_ptr<ILLMClient>> clients;
+    clients.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto client = llm_factory ? llm_factory() : nullptr;
+        if (!client) {
+            throw std::runtime_error("Failed to create LLM client.");
+        }
+        clients.push_back(std::move(client));
+    }
+    return clients;
+}
+
+CategorizationService::ConcurrentChunkItem CategorizationService::prepare_chunk_item(
+    const FileEntry& entry,
+    bool is_local_llm,
+    const EntryCallbacks& callbacks,
+    const RemoteThrottleCallback& remote_throttle_callback,
+    const SessionHistoryMap& session_history) const
+{
+    const std::string suggested_name = callbacks.suggested_name_provider
+        ? callbacks.suggested_name_provider(entry)
+        : std::string();
+    const auto override_value = callbacks.prompt_override ? callbacks.prompt_override(entry) : std::nullopt;
+
+    ConcurrentChunkItem item;
+    item.prepared = prepare_entry(entry, override_value, suggested_name, session_history);
+    const auto& prepared = item.prepared;
+    if (auto cached = try_cached_categorization(entry.file_name,
+                                                prepared.display_path,
+                                                prepared.prompt_path_display,
+                                                prepared.dir_path,
+                                                entry.type,
+                                                callbacks.progress)) {
+        item.resolved = *cached;
+        item.cache_hit = true;
+    } else if (!is_local_llm && !ensure_remote_credentials_for_request(entry.file_name, callbacks.progress)) {
+        item.resolved = DatabaseManager::ResolvedCategory{-1, "", ""};
+    } else if (!is_local_llm && remote_throttle_callback && !remote_throttle_callback(entry.file_name)) {
+        item.resolved = DatabaseManager::ResolvedCategory{-1, "", ""};
+    } else {
+        item.needs_request = true;
+    }
+    return item;
+}
+
+bool CategorizationService::commit_chunk_item(
+    ConcurrentChunkItem& item,
+    BoundedWorkExecutor::Outcome<LlmResponse>* outcome,
+    ILLMClient& coordinator_llm,
+    bool is_local_llm,
+    const EntryCallbacks& callbacks,
+    SessionHistoryMap& session_history,
+    std::vector<CategorizedFile>& categorized) const
+{
+    const auto& prepared = item.prepared;
+    const FileEntry& entry = prepared.entry;
+    bool cancelled = false;
+
+    if (item.request_index) {
+        if (!outcome->attempted()) {
+            // Stop was requested before this request began: no effects and no result, but the
+            // queued item still gets its completion so the GUI row does not stay "in progress".
+            if (callbacks.completion) {
+                callbacks.completion(entry);
+            }
+            return false;
+        }
+        if (outcome->error) {
+            // Same semantics as the sequential path: a request failure is logged and aborts the run.
+            try {
+                std::rethrow_exception(outcome->error);
+            } catch (const std::exception& ex) {
+                report_llm_failure(callbacks.progress, entry.file_name, ex);
+                throw;
+            }
+        }
+        const LlmResponse& response = outcome->value.value();
+        for (const auto& note : response.notes) {
+            if (callbacks.progress) {
+                callbacks.progress(note);
+            }
+        }
+        if (response.cancelled) {
+            cancelled = true;
+        } else {
+            item.resolved = resolve_llm_category_response(coordinator_llm,
+                                                          entry.file_name,
+                                                          prepared.display_path,
+                                                          prepared.prompt_name,
+                                                          prepared.prompt_path_display,
+                                                          entry.type,
+                                                          callbacks.progress,
+                                                          response.raw);
+        }
+    } else if (item.cache_hit) {
+        const auto display_resolved = localize_resolved_category(coordinator_llm, item.resolved);
+        emit_progress_message(callbacks.progress,
+                              "CACHE",
+                              entry.file_name,
+                              display_resolved,
+                              prepared.display_path,
+                              prepared.prompt_path_display);
+    }
+
+    if (!cancelled) {
+        if (auto categorized_entry = finish_entry(prepared,
+                                                  item.resolved,
+                                                  is_local_llm,
+                                                  callbacks.recategorization,
+                                                  session_history)) {
+            categorized.push_back(*categorized_entry);
+            if (callbacks.result) {
+                callbacks.result(*categorized_entry);
+            }
+        }
+    }
+
+    if (callbacks.completion) {
+        callbacks.completion(entry);
+    }
+    return true;
 }
 
 CategorizationService::LlmResponse CategorizationService::execute_llm_request(
@@ -1495,6 +1548,74 @@ DatabaseManager::ResolvedCategory CategorizationService::categorize_via_llm(
                                          raw_response);
 }
 
+std::pair<std::string, std::string> CategorizationService::normalize_llm_labels(
+    const std::string& display_name,
+    const std::string& prompt_name,
+    FileType file_type,
+    std::string category,
+    std::string subcategory,
+    const std::vector<std::string>& effective_allowed_categories) const
+{
+    const bool prefer_stable_taxonomy = settings.get_use_consistency_hints();
+
+    const std::pair<std::string, std::string> before_image{category, subcategory};
+    std::tie(category, subcategory) = normalize_image_category_labels(prompt_name,
+                                                                      file_type,
+                                                                      category,
+                                                                      subcategory,
+                                                                      settings.get_use_whitelist(),
+                                                                      effective_allowed_categories,
+                                                                      prefer_stable_taxonomy);
+    log_label_change(core_logger, "image", display_name, before_image, category, subcategory);
+
+    const std::pair<std::string, std::string> before_document{category, subcategory};
+    std::tie(category, subcategory) = normalize_document_category_labels(prompt_name,
+                                                                         file_type,
+                                                                         category,
+                                                                         subcategory,
+                                                                         settings.get_use_whitelist(),
+                                                                         prefer_stable_taxonomy);
+    log_label_change(core_logger, "document", display_name, before_document, category, subcategory);
+
+    const std::pair<std::string, std::string> before_artifact{category, subcategory};
+    std::tie(category, subcategory) = normalize_artifact_category_labels(prompt_name,
+                                                                         file_type,
+                                                                         category,
+                                                                         subcategory,
+                                                                         settings.get_use_whitelist());
+    log_label_change(core_logger, "artifact", display_name, before_artifact, category, subcategory);
+
+    return {category, subcategory};
+}
+
+void CategorizationService::apply_whitelist_to_resolved(
+    DatabaseManager::ResolvedCategory& resolved,
+    const std::vector<std::string>& effective_allowed_categories,
+    const std::vector<std::string>& allowed_subcategories,
+    const std::unordered_map<std::string, std::vector<std::string>>& allowed_subcategories_by_category) const
+{
+    if (!settings.get_use_whitelist()) {
+        return;
+    }
+    bool whitelist_adjusted = false;
+    if (!is_allowed(resolved.category, effective_allowed_categories)) {
+        resolved.category = first_allowed_or_blank(effective_allowed_categories);
+        whitelist_adjusted = true;
+    }
+    if (!is_allowed_subcategory_for_category(resolved.category,
+                                             resolved.subcategory,
+                                             allowed_subcategories,
+                                             allowed_subcategories_by_category)) {
+        resolved.subcategory = first_allowed_subcategory_for_category(resolved.category,
+                                                                      allowed_subcategories,
+                                                                      allowed_subcategories_by_category);
+        whitelist_adjusted = true;
+    }
+    if (whitelist_adjusted) {
+        resolved = db_manager.resolve_category(resolved.category, resolved.subcategory);
+    }
+}
+
 DatabaseManager::ResolvedCategory CategorizationService::resolve_llm_category_response(
     ILLMClient& llm,
     const std::string& display_name,
@@ -1515,78 +1636,17 @@ DatabaseManager::ResolvedCategory CategorizationService::resolve_llm_category_re
         const auto allowed_subcategories_by_category = settings.get_allowed_subcategories_by_category();
         const auto effective_allowed_categories =
             allowed_categories_for_whitelist(allowed_categories, allowed_subcategories_by_category);
-        const bool prefer_stable_taxonomy = settings.get_use_consistency_hints();
-        const std::string original_category = category;
-        const std::string original_subcategory = subcategory;
-        std::tie(category, subcategory) = normalize_image_category_labels(prompt_name,
-                                                                          file_type,
-                                                                          category,
-                                                                          subcategory,
-                                                                          settings.get_use_whitelist(),
-                                                                          effective_allowed_categories,
-                                                                          prefer_stable_taxonomy);
-        if (core_logger &&
-            (category != original_category || subcategory != original_subcategory)) {
-            core_logger->info("Normalized image category for '{}' from '{}'/'{}' to '{}'/'{}'",
-                              display_name,
-                              original_category,
-                              original_subcategory,
-                              category,
-                              subcategory);
-        }
-        const std::string pre_document_category = category;
-        const std::string pre_document_subcategory = subcategory;
-        std::tie(category, subcategory) = normalize_document_category_labels(prompt_name,
-                                                                             file_type,
-                                                                             category,
-                                                                             subcategory,
-                                                                             settings.get_use_whitelist(),
-                                                                             prefer_stable_taxonomy);
-        if (core_logger &&
-            (category != pre_document_category || subcategory != pre_document_subcategory)) {
-            core_logger->info("Normalized document category for '{}' from '{}'/'{}' to '{}'/'{}'",
-                              display_name,
-                              pre_document_category,
-                              pre_document_subcategory,
-                              category,
-                              subcategory);
-        }
-        const std::string pre_artifact_category = category;
-        const std::string pre_artifact_subcategory = subcategory;
-        std::tie(category, subcategory) = normalize_artifact_category_labels(prompt_name,
-                                                                             file_type,
-                                                                             category,
-                                                                             subcategory,
-                                                                             settings.get_use_whitelist());
-        if (core_logger &&
-            (category != pre_artifact_category || subcategory != pre_artifact_subcategory)) {
-            core_logger->info("Normalized artifact category for '{}' from '{}'/'{}' to '{}'/'{}'",
-                              display_name,
-                              pre_artifact_category,
-                              pre_artifact_subcategory,
-                              category,
-                              subcategory);
-        }
+        std::tie(category, subcategory) = normalize_llm_labels(display_name,
+                                                               prompt_name,
+                                                               file_type,
+                                                               category,
+                                                               subcategory,
+                                                               effective_allowed_categories);
         auto resolved = db_manager.resolve_category(category, subcategory);
-        if (settings.get_use_whitelist()) {
-            bool whitelist_adjusted = false;
-            if (!is_allowed(resolved.category, effective_allowed_categories)) {
-                resolved.category = first_allowed_or_blank(effective_allowed_categories);
-                whitelist_adjusted = true;
-            }
-            if (!is_allowed_subcategory_for_category(resolved.category,
-                                                     resolved.subcategory,
-                                                     allowed_subcategories,
-                                                     allowed_subcategories_by_category)) {
-                resolved.subcategory = first_allowed_subcategory_for_category(resolved.category,
-                                                                              allowed_subcategories,
-                                                                              allowed_subcategories_by_category);
-                whitelist_adjusted = true;
-            }
-            if (whitelist_adjusted) {
-                resolved = db_manager.resolve_category(resolved.category, resolved.subcategory);
-            }
-        }
+        apply_whitelist_to_resolved(resolved,
+                                    effective_allowed_categories,
+                                    allowed_subcategories,
+                                    allowed_subcategories_by_category);
         resolved = prefer_learned_candidate_for_generic_result(resolved, prompt_name, prompt_path, file_type);
         const auto validation = CategorizationResponseParser::validate_labels(resolved.category,
                                                                               resolved.subcategory);

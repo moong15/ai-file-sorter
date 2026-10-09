@@ -107,6 +107,49 @@ void configure_remote_settings(Settings& settings, int concurrency) {
     settings.set_llm_concurrency(concurrency);
 }
 
+// Records which threads entered each client. Clients are created on the coordinator thread in
+// slot order, so instance 0 is the slot that worker 0 (the coordinator thread) always serves.
+struct ThreadTrace {
+    std::mutex mutex;
+    std::vector<std::set<std::thread::id>> ids_by_instance;
+    std::set<std::thread::id> all_ids;
+    std::atomic<int> calls{0};
+};
+
+class ThreadRecordingLLM : public ILLMClient {
+public:
+    explicit ThreadRecordingLLM(std::shared_ptr<ThreadTrace> trace) : trace_(std::move(trace)) {
+        std::lock_guard<std::mutex> lock(trace_->mutex);
+        index_ = trace_->ids_by_instance.size();
+        trace_->ids_by_instance.emplace_back();
+    }
+
+    std::string categorize_file(const std::string&,
+                                const std::string&,
+                                FileType,
+                                const std::string&) override {
+        const auto id = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> lock(trace_->mutex);
+            trace_->ids_by_instance[index_].insert(id);
+            trace_->all_ids.insert(id);
+        }
+        ++trace_->calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return "Documents : Reports";
+    }
+
+    std::string complete_prompt(const std::string&, int) override {
+        return "Documents : Reports";
+    }
+
+    void set_prompt_logging_enabled(bool) override {}
+
+private:
+    std::shared_ptr<ThreadTrace> trace_;
+    size_t index_ = 0;
+};
+
 } // namespace
 
 TEST_CASE("LLM concurrency setting defaults to one and clamps to supported levels") {
@@ -517,49 +560,6 @@ TEST_CASE("Concurrent categorization honours stop: no new requests, no deadlock,
 }
 
 TEST_CASE("Concurrent categorization calls the client on the worker thread without spawning a helper thread") {
-    // Records which threads entered each client. Clients are created on the coordinator thread in
-    // slot order, so instance 0 is the slot that worker 0 (the coordinator thread) always serves.
-    struct ThreadTrace {
-        std::mutex mutex;
-        std::vector<std::set<std::thread::id>> ids_by_instance;
-        std::set<std::thread::id> all_ids;
-        std::atomic<int> calls{0};
-    };
-
-    class ThreadRecordingLLM : public ILLMClient {
-    public:
-        explicit ThreadRecordingLLM(std::shared_ptr<ThreadTrace> trace) : trace_(std::move(trace)) {
-            std::lock_guard<std::mutex> lock(trace_->mutex);
-            index_ = trace_->ids_by_instance.size();
-            trace_->ids_by_instance.emplace_back();
-        }
-
-        std::string categorize_file(const std::string&,
-                                    const std::string&,
-                                    FileType,
-                                    const std::string&) override {
-            const auto id = std::this_thread::get_id();
-            {
-                std::lock_guard<std::mutex> lock(trace_->mutex);
-                trace_->ids_by_instance[index_].insert(id);
-                trace_->all_ids.insert(id);
-            }
-            ++trace_->calls;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            return "Documents : Reports";
-        }
-
-        std::string complete_prompt(const std::string&, int) override {
-            return "Documents : Reports";
-        }
-
-        void set_prompt_logging_enabled(bool) override {}
-
-    private:
-        std::shared_ptr<ThreadTrace> trace_;
-        size_t index_ = 0;
-    };
-
     TempDir config_dir;
     EnvVarGuard config_guard("AI_FILE_SORTER_CONFIG_DIR", config_dir.path().string());
     Settings settings;

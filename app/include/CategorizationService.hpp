@@ -2,6 +2,7 @@
 #define CATEGORIZATION_SERVICE_HPP
 
 #include "Types.hpp"
+#include "BoundedWorkExecutor.hpp"
 #include "DatabaseManager.hpp"
 
 #include <atomic>
@@ -139,6 +140,33 @@ private:
         std::vector<std::string> notes;
         /// True when stop was requested while waiting out a rate limit.
         bool cancelled{false};
+    };
+
+    /**
+     * @brief Caller-supplied callbacks for one categorization run.
+     */
+    struct EntryCallbacks {
+        const ProgressCallback& progress;
+        const QueueCallback& queue;
+        const CompletionCallback& completion;
+        const RecategorizationCallback& recategorization;
+        const PromptOverrideProvider& prompt_override;
+        const SuggestedNameProvider& suggested_name_provider;
+        const ResultCallback& result;
+    };
+
+    /**
+     * @brief Per-entry state for one chunk of the concurrent categorization path.
+     *
+     * Items that need no request carry their resolved category directly. The others set
+     * needs_request and, once queued, refer to their slot in the chunk's request list.
+     */
+    struct ConcurrentChunkItem {
+        PreparedEntry prepared;
+        DatabaseManager::ResolvedCategory resolved;
+        bool cache_hit{false};
+        std::optional<size_t> request_index;
+        bool needs_request{false};
     };
 
     /**
@@ -554,6 +582,37 @@ private:
         const std::string& raw_response) const;
 
     /**
+     * @brief Applies the image, document and artifact label normalizers and logs each change.
+     * @param display_name Display name for logging.
+     * @param prompt_name Name used in the prompt.
+     * @param file_type File or directory.
+     * @param category Category returned by the LLM.
+     * @param subcategory Subcategory returned by the LLM.
+     * @param effective_allowed_categories Whitelist main categories in effect.
+     * @return Normalized category and subcategory.
+     */
+    std::pair<std::string, std::string> normalize_llm_labels(
+        const std::string& display_name,
+        const std::string& prompt_name,
+        FileType file_type,
+        std::string category,
+        std::string subcategory,
+        const std::vector<std::string>& effective_allowed_categories) const;
+
+    /**
+     * @brief Moves a resolved category onto the whitelist when it falls outside it.
+     * @param resolved Resolved category, updated in place when the whitelist applies.
+     * @param effective_allowed_categories Whitelist main categories in effect.
+     * @param allowed_subcategories Flat whitelist subcategories.
+     * @param allowed_subcategories_by_category Whitelist subcategories keyed by main category.
+     */
+    void apply_whitelist_to_resolved(
+        DatabaseManager::ResolvedCategory& resolved,
+        const std::vector<std::string>& effective_allowed_categories,
+        const std::vector<std::string>& allowed_subcategories,
+        const std::unordered_map<std::string, std::vector<std::string>>& allowed_subcategories_by_category) const;
+
+    /**
      * @brief Emits and logs an LLM failure before it propagates.
      */
     void report_llm_failure(const ProgressCallback& progress_callback,
@@ -577,7 +636,13 @@ private:
      * Entries are processed in chunks. For each chunk the coordinator prepares every entry in
      * input order, workers run the HTTP requests (at most `concurrency` at a time, each with its
      * own client), and the coordinator then commits results in input order.
+     * @param files Entries to categorize.
+     * @param is_local_llm True when using a local LLM backend.
      * @param concurrency Number of worker clients; must be greater than one.
+     * @param stop_flag Cancellation flag.
+     * @param llm_factory Creates one LLM client per worker slot.
+     * @param callbacks Callbacks for progress, queueing, completion, recategorization, prompt
+     *        overrides, suggested names and results.
      * @return Categorized entries, in input order.
      */
     std::vector<CategorizedFile> categorize_entries_concurrent(
@@ -585,14 +650,52 @@ private:
         bool is_local_llm,
         size_t concurrency,
         std::atomic<bool>& stop_flag,
-        const ProgressCallback& progress_callback,
-        const QueueCallback& queue_callback,
-        const CompletionCallback& completion_callback,
-        const RecategorizationCallback& recategorization_callback,
         const std::function<std::unique_ptr<ILLMClient>()>& llm_factory,
-        const PromptOverrideProvider& prompt_override,
-        const SuggestedNameProvider& suggested_name_provider,
-        const ResultCallback& result_callback) const;
+        const EntryCallbacks& callbacks) const;
+
+    /**
+     * @brief Creates one LLM client per worker slot on the calling (coordinator) thread.
+     * @param llm_factory Creates one LLM client.
+     * @param count Number of clients to create.
+     * @return Created clients, in slot order.
+     */
+    std::vector<std::unique_ptr<ILLMClient>> create_worker_clients(
+        const std::function<std::unique_ptr<ILLMClient>()>& llm_factory,
+        size_t count) const;
+
+    /**
+     * @brief Prepares one entry of a concurrent chunk and decides whether it needs an LLM request.
+     * @param entry File entry to prepare.
+     * @param is_local_llm True when using a local LLM backend.
+     * @param callbacks Callbacks used for suggested names, prompt overrides and progress.
+     * @param remote_throttle_callback Optional callback invoked before remote cache misses.
+     * @param session_history Session history snapshot used for consistency hints.
+     * @return Chunk item; needs_request is set when a request must be dispatched.
+     */
+    ConcurrentChunkItem prepare_chunk_item(const FileEntry& entry,
+                                           bool is_local_llm,
+                                           const EntryCallbacks& callbacks,
+                                           const RemoteThrottleCallback& remote_throttle_callback,
+                                           const SessionHistoryMap& session_history) const;
+
+    /**
+     * @brief Commits one prepared chunk item in input order. Coordinator thread only.
+     * @param item Chunk item; its resolved category is updated when a reply was received.
+     * @param outcome Worker outcome for the item's request, or nullptr when it has none.
+     * @param coordinator_llm Client used for localization.
+     * @param is_local_llm True when using a local LLM backend.
+     * @param callbacks Callbacks for progress, completion, recategorization and results.
+     * @param session_history Session history updated with the committed assignment.
+     * @param categorized Review list that committed entries are appended to.
+     * @return True when the item counts toward completed items; false when it was never attempted.
+     */
+    bool commit_chunk_item(ConcurrentChunkItem& item,
+                           BoundedWorkExecutor::Outcome<LlmResponse>* outcome,
+                           ILLMClient& coordinator_llm,
+                           bool is_local_llm,
+                           const EntryCallbacks& callbacks,
+                           SessionHistoryMap& session_history,
+                           std::vector<CategorizedFile>& categorized) const;
 
 #ifdef AI_FILE_SORTER_TEST_BUILD
     friend class CategorizationServiceTestAccess;
