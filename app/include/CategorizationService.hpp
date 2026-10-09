@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <deque>
+#include <exception>
 #include <future>
 #include <functional>
 #include <memory>
@@ -110,6 +111,35 @@ private:
     using HintHistory = std::deque<CategoryPair>;
     using SessionHistoryMap = std::unordered_map<std::string, HintHistory>;
     using RemoteThrottleCallback = std::function<bool(const std::string&)>;
+
+    /**
+     * @brief Everything needed to categorize one entry, computed on the coordinator thread.
+     *
+     * Built from immutable inputs and a session-history snapshot before any request is
+     * dispatched, so worker threads never read mutable categorization state.
+     */
+    struct PreparedEntry {
+        FileEntry entry;
+        std::string suggested_name;
+        bool use_consistency_hints{false};
+        std::string dir_path;
+        std::string display_path;
+        std::string prompt_name;
+        std::string prompt_path;          ///< Raw prompt path (learning context source).
+        std::string prompt_path_display;  ///< Abbreviated prompt path used in requests.
+        std::string combined_context;
+    };
+
+    /**
+     * @brief Raw LLM output for one prepared entry, produced on a worker thread.
+     */
+    struct LlmResponse {
+        std::string raw;
+        /// Rate-limit notices to be shown by the coordinator in order.
+        std::vector<std::string> notes;
+        /// True when stop was requested while waiting out a rate limit.
+        bool cancelled{false};
+    };
 
     /**
      * @brief Returns a cached categorization when available, otherwise calls the LLM.
@@ -455,6 +485,114 @@ private:
      * @return Prompt block string.
      */
     std::string format_hint_block(const std::vector<CategoryPair>& hints) const;
+
+    /**
+     * @brief Builds the per-entry inputs used by both the sequential and concurrent paths.
+     * @param entry File entry to categorize.
+     * @param prompt_override Optional prompt override.
+     * @param suggested_name Suggested rename value.
+     * @param session_history Session history snapshot used for consistency hints.
+     * @return Prepared entry.
+     */
+    PreparedEntry prepare_entry(const FileEntry& entry,
+                                const std::optional<PromptOverride>& prompt_override,
+                                const std::string& suggested_name,
+                                const SessionHistoryMap& session_history) const;
+
+    /**
+     * @brief Applies a resolved category: empty-result handling, persistence, and the review row.
+     * @param prepared Prepared entry.
+     * @param resolved Resolved category data.
+     * @param is_local_llm True when using a local LLM backend.
+     * @param recategorization_callback Callback for re-categorization events.
+     * @param session_history Session history updated with the committed assignment.
+     * @return Categorized entry when it should appear in the review list.
+     */
+    std::optional<CategorizedFile> finish_entry(const PreparedEntry& prepared,
+                                                const DatabaseManager::ResolvedCategory& resolved,
+                                                bool is_local_llm,
+                                                const RecategorizationCallback& recategorization_callback,
+                                                SessionHistoryMap& session_history) const;
+
+    /**
+     * @brief Sends the LLM request for a prepared entry. Safe to run on a worker thread.
+     *
+     * Only reads immutable settings and touches the supplied client. The request is synchronous
+     * and relies on the client's transport timeout. Rate-limit waits are
+     * performed here and reported through LlmResponse::notes instead of callbacks.
+     * @param llm Client owned by the calling worker.
+     * @param is_local_llm True when using a local LLM backend.
+     * @param prepared Prepared entry.
+     * @param stop_flag Cancellation flag.
+     * @return Raw response or cancellation status.
+     */
+    LlmResponse execute_llm_request(ILLMClient& llm,
+                                    bool is_local_llm,
+                                    const PreparedEntry& prepared,
+                                    std::atomic<bool>& stop_flag) const;
+
+    /**
+     * @brief Turns a raw LLM reply into a resolved category. Coordinator thread only.
+     * @param llm Client used for optional localization.
+     * @param display_name Display name for logging.
+     * @param display_path Display path for logging.
+     * @param prompt_name Name used in the prompt.
+     * @param prompt_path Path used in the prompt.
+     * @param file_type File or directory.
+     * @param progress_callback Progress updates callback.
+     * @param raw_response Raw LLM reply.
+     * @return Resolved category; taxonomy_id -1 marks an invalid reply.
+     */
+    DatabaseManager::ResolvedCategory resolve_llm_category_response(
+        ILLMClient& llm,
+        const std::string& display_name,
+        const std::string& display_path,
+        const std::string& prompt_name,
+        const std::string& prompt_path,
+        FileType file_type,
+        const ProgressCallback& progress_callback,
+        const std::string& raw_response) const;
+
+    /**
+     * @brief Emits and logs an LLM failure before it propagates.
+     */
+    void report_llm_failure(const ProgressCallback& progress_callback,
+                            const std::string& display_name,
+                            const std::exception& ex) const;
+
+    /**
+     * @brief Builds a rate-limit throttle that spaces out remote requests.
+     * @param remote_requests_per_minute Limit; non-positive returns an empty callback.
+     * @param progress_callback Progress updates callback (copied into the throttle).
+     * @param stop_flag Cancellation flag that interrupts waits.
+     * @return Throttle callback, or empty when throttling is disabled.
+     */
+    RemoteThrottleCallback make_remote_throttle(int remote_requests_per_minute,
+                                                const ProgressCallback& progress_callback,
+                                                std::atomic<bool>& stop_flag) const;
+
+    /**
+     * @brief Categorizes entries with bounded concurrent LLM requests.
+     *
+     * Entries are processed in chunks. For each chunk the coordinator prepares every entry in
+     * input order, workers run the HTTP requests (at most `concurrency` at a time, each with its
+     * own client), and the coordinator then commits results in input order.
+     * @param concurrency Number of worker clients; must be greater than one.
+     * @return Categorized entries, in input order.
+     */
+    std::vector<CategorizedFile> categorize_entries_concurrent(
+        const std::vector<FileEntry>& files,
+        bool is_local_llm,
+        size_t concurrency,
+        std::atomic<bool>& stop_flag,
+        const ProgressCallback& progress_callback,
+        const QueueCallback& queue_callback,
+        const CompletionCallback& completion_callback,
+        const RecategorizationCallback& recategorization_callback,
+        const std::function<std::unique_ptr<ILLMClient>()>& llm_factory,
+        const PromptOverrideProvider& prompt_override,
+        const SuggestedNameProvider& suggested_name_provider,
+        const ResultCallback& result_callback) const;
 
 #ifdef AI_FILE_SORTER_TEST_BUILD
     friend class CategorizationServiceTestAccess;
