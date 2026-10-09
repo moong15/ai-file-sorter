@@ -49,6 +49,43 @@ QImage decode_bounded(const std::filesystem::path& image_path)
     return image;
 }
 
+// Builds {"role":"user","content":[text part, image part]}; the text part comes first.
+Json::Value make_user_message(const std::string& user_text, const std::string& image_data_url)
+{
+    Json::Value text_part(Json::objectValue);
+    text_part["type"] = "text";
+    text_part["text"] = user_text;
+
+    Json::Value image_url(Json::objectValue);
+    image_url["url"] = image_data_url;
+    Json::Value image_part(Json::objectValue);
+    image_part["type"] = "image_url";
+    image_part["image_url"] = image_url;
+
+    Json::Value user_content(Json::arrayValue);
+    user_content.append(text_part);
+    user_content.append(image_part);
+    Json::Value user_message(Json::objectValue);
+    user_message["role"] = "user";
+    user_message["content"] = user_content;
+    return user_message;
+}
+
+Json::Value parse_response_format(const std::string& response_format_json)
+{
+    Json::CharReaderBuilder reader_builder;
+    std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
+    Json::Value response_format;
+    std::string errors;
+    if (!reader->parse(response_format_json.data(),
+                       response_format_json.data() + response_format_json.size(),
+                       &response_format,
+                       &errors)) {
+        throw std::runtime_error("Invalid response_format JSON: " + errors);
+    }
+    return response_format;
+}
+
 } // namespace
 
 PreparedImage prepare_image_data_url(const std::filesystem::path& image_path)
@@ -92,26 +129,9 @@ std::string build_image_chat_payload(const std::string& model,
     system_message["role"] = "system";
     system_message["content"] = system_prompt;
 
-    Json::Value text_part(Json::objectValue);
-    text_part["type"] = "text";
-    text_part["text"] = user_text;
-
-    Json::Value image_url(Json::objectValue);
-    image_url["url"] = image_data_url;
-    Json::Value image_part(Json::objectValue);
-    image_part["type"] = "image_url";
-    image_part["image_url"] = image_url;
-
-    Json::Value user_content(Json::arrayValue);
-    user_content.append(text_part);
-    user_content.append(image_part);
-    Json::Value user_message(Json::objectValue);
-    user_message["role"] = "user";
-    user_message["content"] = user_content;
-
     Json::Value messages(Json::arrayValue);
     messages.append(system_message);
-    messages.append(user_message);
+    messages.append(make_user_message(user_text, image_data_url));
 
     Json::Value root(Json::objectValue);
     root["model"] = model;
@@ -121,17 +141,7 @@ std::string build_image_chat_payload(const std::string& model,
         root["max_tokens"] = max_tokens;
     }
     if (!response_format_json.empty()) {
-        Json::CharReaderBuilder reader_builder;
-        std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
-        Json::Value response_format;
-        std::string errors;
-        if (!reader->parse(response_format_json.data(),
-                           response_format_json.data() + response_format_json.size(),
-                           &response_format,
-                           &errors)) {
-            throw std::runtime_error("Invalid response_format JSON: " + errors);
-        }
-        root["response_format"] = response_format;
+        root["response_format"] = parse_response_format(response_format_json);
     }
 
     Json::StreamWriterBuilder builder;
